@@ -12,15 +12,15 @@ permissions:
 jobs:
   sponsored-runner:
     name: Verify organization-sponsored runner
-    if: github.repository == 'miclle/qiniu-ci-runner'
+    if: github.repository == 'lijiahao818/qiniu-ci-runner'
     runs-on: [qiniu, ubuntu-24.04]
     timeout-minutes: 15
     steps:
       - name: Verify fork-owned job context
         shell: bash
         env:
-          EXPECTED_REPOSITORY: miclle/qiniu-ci-runner
-          EXPECTED_OWNER: miclle
+          EXPECTED_REPOSITORY: lijiahao818/qiniu-ci-runner
+          EXPECTED_OWNER: lijiahao818
         run: |
           set -euo pipefail
 
