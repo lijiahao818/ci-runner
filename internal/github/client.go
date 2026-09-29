@@ -131,6 +131,19 @@ type OrganizationMembership struct {
 	Role              string
 }
 
+type CollaboratorPermission struct {
+	Permission string
+	UserID     int64
+	UserLogin  string
+}
+
+type OrganizationMember struct {
+	State     string
+	Role      string
+	UserID    int64
+	UserLogin string
+}
+
 type Runner struct {
 	ID     int64  `json:"id"`
 	Name   string `json:"name"`
@@ -368,6 +381,21 @@ func (c *Client) ListInstallationRepositories(ctx context.Context, installationI
 
 // ListUserInstallationRepositories lists repositories accessible to both the user token and installation.
 func (c *Client) ListUserInstallationRepositories(ctx context.Context, token string, installationID int64) ([]string, error) {
+	repositories, err := c.ListUserInstallationRepositoryDetails(ctx, token, installationID)
+	if err != nil {
+		return nil, err
+	}
+	fullNames := make([]string, 0, len(repositories))
+	for _, repository := range repositories {
+		if fullName := strings.TrimSpace(repository.FullName); fullName != "" {
+			fullNames = append(fullNames, fullName)
+		}
+	}
+	return fullNames, nil
+}
+
+// ListUserInstallationRepositoryDetails lists repository metadata accessible to both the user token and installation.
+func (c *Client) ListUserInstallationRepositoryDetails(ctx context.Context, token string, installationID int64) ([]Repository, error) {
 	token = strings.TrimSpace(token)
 	if token == "" {
 		return nil, fmt.Errorf("github oauth token is required")
@@ -376,7 +404,7 @@ func (c *Client) ListUserInstallationRepositories(ctx context.Context, token str
 		return nil, fmt.Errorf("installation id is required")
 	}
 	nextURL := fmt.Sprintf("%s/user/installations/%d/repositories?per_page=100", c.baseURL, installationID)
-	var repositories []string
+	var repositories []Repository
 	for nextURL != "" {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, nextURL, nil)
 		if err != nil {
@@ -403,18 +431,12 @@ func (c *Client) ListUserInstallationRepositories(ctx context.Context, token str
 			}
 		}
 		var out struct {
-			Repositories []struct {
-				FullName string `json:"full_name"`
-			} `json:"repositories"`
+			Repositories []Repository `json:"repositories"`
 		}
 		if err := json.Unmarshal(body, &out); err != nil {
 			return nil, err
 		}
-		for _, repo := range out.Repositories {
-			if fullName := strings.TrimSpace(repo.FullName); fullName != "" {
-				repositories = append(repositories, fullName)
-			}
-		}
+		repositories = append(repositories, out.Repositories...)
 		nextURL = nextLink(resp.Header.Get("Link"))
 	}
 	return repositories, nil
@@ -1051,6 +1073,92 @@ func (c *Client) GetRepository(ctx context.Context, repositoryFullName string) (
 	return repository, nil
 }
 
+func (c *Client) GetRepositoryCollaboratorPermission(ctx context.Context, repositoryFullName, username string) (CollaboratorPermission, error) {
+	startedAt := time.Now()
+	result := "error"
+	defer func() {
+		metrics.RecordGitHubAPI("get_repository_collaborator_permission", result, time.Since(startedAt))
+	}()
+	repositoryFullName = c.repositoryFullName(repositoryFullName)
+	username = strings.TrimSpace(username)
+	if repositoryFullName == "" || username == "" {
+		return CollaboratorPermission{}, fmt.Errorf("repository full name and username are required")
+	}
+	url := fmt.Sprintf("%s/repos/%s/collaborators/%s/permission", c.baseURL, repositoryFullName, url.PathEscape(username))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return CollaboratorPermission{}, err
+	}
+	setGitHubHeaders(req)
+	resp, err := c.do(req, repositoryFullName)
+	if err != nil {
+		return CollaboratorPermission{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return CollaboratorPermission{}, fmt.Errorf("read github collaborator permission response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return CollaboratorPermission{}, fmt.Errorf("github collaborator permission: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var payload struct {
+		Permission string  `json:"permission"`
+		User       Account `json:"user"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return CollaboratorPermission{}, err
+	}
+	if payload.User.ID <= 0 || strings.TrimSpace(payload.User.Login) == "" {
+		return CollaboratorPermission{}, fmt.Errorf("github collaborator permission response missing user identity")
+	}
+	result = "success"
+	return CollaboratorPermission{Permission: strings.ToLower(strings.TrimSpace(payload.Permission)), UserID: payload.User.ID, UserLogin: payload.User.Login}, nil
+}
+
+func (c *Client) GetOrganizationMembership(ctx context.Context, sourceRepositoryFullName, organization, username string) (OrganizationMember, error) {
+	startedAt := time.Now()
+	result := "error"
+	defer func() { metrics.RecordGitHubAPI("get_organization_membership", result, time.Since(startedAt)) }()
+	sourceRepositoryFullName = c.repositoryFullName(sourceRepositoryFullName)
+	organization = strings.TrimSpace(organization)
+	username = strings.TrimSpace(username)
+	if sourceRepositoryFullName == "" || organization == "" || username == "" {
+		return OrganizationMember{}, fmt.Errorf("source repository, organization, and username are required")
+	}
+	url := fmt.Sprintf("%s/orgs/%s/memberships/%s", c.baseURL, url.PathEscape(organization), url.PathEscape(username))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return OrganizationMember{}, err
+	}
+	setGitHubHeaders(req)
+	resp, err := c.do(req, sourceRepositoryFullName)
+	if err != nil {
+		return OrganizationMember{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return OrganizationMember{}, fmt.Errorf("read github organization membership response: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return OrganizationMember{}, fmt.Errorf("github organization membership: status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var payload struct {
+		State string  `json:"state"`
+		Role  string  `json:"role"`
+		User  Account `json:"user"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return OrganizationMember{}, err
+	}
+	if payload.User.ID <= 0 || strings.TrimSpace(payload.User.Login) == "" {
+		return OrganizationMember{}, fmt.Errorf("github organization membership response missing user identity")
+	}
+	result = "success"
+	return OrganizationMember{State: strings.ToLower(strings.TrimSpace(payload.State)), Role: strings.ToLower(strings.TrimSpace(payload.Role)), UserID: payload.User.ID, UserLogin: payload.User.Login}, nil
+}
+
 func (c *Client) GetPullRequest(ctx context.Context, repositoryFullName string, number int64) (PullRequest, error) {
 	startedAt := time.Now()
 	result := "error"
@@ -1512,10 +1620,14 @@ type Issue struct {
 }
 
 type Repository struct {
-	ID            int64  `json:"id"`
-	FullName      string `json:"full_name"`
-	Name          string `json:"name"`
-	DefaultBranch string `json:"default_branch"`
+	ID            int64       `json:"id"`
+	FullName      string      `json:"full_name"`
+	Name          string      `json:"name"`
+	DefaultBranch string      `json:"default_branch"`
+	Fork          bool        `json:"fork"`
+	Owner         Account     `json:"owner"`
+	Parent        *Repository `json:"parent,omitempty"`
+	Source        *Repository `json:"source,omitempty"`
 }
 
 type WorkflowRun struct {
